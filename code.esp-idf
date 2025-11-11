@@ -1,10 +1,16 @@
 #include "esp_camera.h"
 #include "esp_http_server.h"
 #include <WiFi.h>
+#include "FS.h"
+#include "SD_MMC.h"
 
 // WiFi credentials
 const char* ssid = "Motorola";
 const char* password = "edge50pro";
+
+// Photo counter
+int photoCount = 0;
+bool sdCardAvailable = false;
 
 // Camera pin definitions for AI-THINKER ESP32-CAM
 #define PWDN_GPIO_NUM     32
@@ -26,13 +32,77 @@ const char* password = "edge50pro";
 
 void startCameraServer();
 
+// Initialize SD card
+void initSDCard() {
+  Serial.println("Initializing SD card...");
+  
+  if(!SD_MMC.begin("/sdcard", true)) {
+    Serial.println("SD Card Mount Failed!");
+    sdCardAvailable = false;
+    return;
+  }
+  
+  uint8_t cardType = SD_MMC.cardType();
+  if(cardType == CARD_NONE) {
+    Serial.println("No SD Card attached");
+    sdCardAvailable = false;
+    return;
+  }
+  
+  Serial.print("SD Card Type: ");
+  if(cardType == CARD_MMC) {
+    Serial.println("MMC");
+  } else if(cardType == CARD_SD) {
+    Serial.println("SDSC");
+  } else if(cardType == CARD_SDHC) {
+    Serial.println("SDHC");
+  } else {
+    Serial.println("UNKNOWN");
+  }
+  
+  uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
+  Serial.printf("SD Card Size: %lluMB\n", cardSize);
+  
+  // Create photos directory if it doesn't exist
+  if(!SD_MMC.exists("/photos")) {
+    SD_MMC.mkdir("/photos");
+    Serial.println("Created /photos directory");
+  }
+  
+  sdCardAvailable = true;
+  Serial.println("SD Card initialized successfully!");
+}
+
+// Save photo to SD card
+String savePhotoToSD(camera_fb_t *fb) {
+  if(!sdCardAvailable) {
+    Serial.println("SD Card not available");
+    return "";
+  }
+  
+  photoCount++;
+  String filename = "/photos/photo_" + String(photoCount) + ".jpg";
+  
+  File file = SD_MMC.open(filename.c_str(), FILE_WRITE);
+  if(!file) {
+    Serial.println("Failed to open file for writing");
+    return "";
+  }
+  
+  file.write(fb->buf, fb->len);
+  file.close();
+  
+  Serial.printf("Photo saved: %s (%d bytes)\n", filename.c_str(), fb->len);
+  return filename;
+}
+
 static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>ESP32-CAM</title>
+  <title>ESP32-CAM with SD Storage</title>
   <style>
     body { 
       font-family: Arial; 
@@ -47,6 +117,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       height: auto;
       border: 3px solid #3498db;
       border-radius: 8px;
+      margin: 10px 0;
     }
     .container { padding: 20px; }
     button {
@@ -60,16 +131,45 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       border-radius: 5px;
     }
     button:hover { background: #2980b9; }
+    .capture-btn {
+      background: #e74c3c;
+      font-size: 20px;
+      padding: 20px 40px;
+    }
+    .capture-btn:hover { background: #c0392b; }
+    .status {
+      background: #34495e;
+      padding: 15px;
+      border-radius: 5px;
+      margin: 20px auto;
+      max-width: 600px;
+    }
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>📷 ESP32-CAM Stream</h1>
+    <h1>📷 ESP32-CAM with SD Storage</h1>
     <img id="stream" src="/stream">
     <br>
-    <button onclick="location.reload()">Refresh</button>
-    <button onclick="document.getElementById('stream').src='/stream?'+Date.now()">Restart Stream</button>
+    <button class="capture-btn" onclick="capturePhoto()">📸 Capture & Save to SD</button>
+    <br>
+    <button onclick="location.reload()">🔄 Refresh</button>
+    <button onclick="document.getElementById('stream').src='/stream?'+Date.now()">▶️ Restart Stream</button>
+    <div class="status" id="status">Ready to capture photos</div>
   </div>
+  <script>
+    function capturePhoto() {
+      document.getElementById('status').innerHTML = 'Capturing photo...';
+      fetch('/capture')
+        .then(response => response.text())
+        .then(data => {
+          document.getElementById('status').innerHTML = data;
+        })
+        .catch(error => {
+          document.getElementById('status').innerHTML = 'Error: ' + error;
+        });
+    }
+  </script>
 </body>
 </html>
 )rawliteral";
@@ -77,6 +177,30 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 static esp_err_t index_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html");
   return httpd_resp_send(req, INDEX_HTML, strlen(INDEX_HTML));
+}
+
+static esp_err_t capture_handler(httpd_req_t *req) {
+  camera_fb_t * fb = NULL;
+  esp_err_t res = ESP_OK;
+  
+  fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    httpd_resp_send(req, "Camera capture failed!", HTTPD_RESP_USE_STRLEN);
+    return ESP_FAIL;
+  }
+  
+  String filename = savePhotoToSD(fb);
+  esp_camera_fb_return(fb);
+  
+  if(filename.length() > 0) {
+    String response = "✅ Photo saved to SD card: " + filename;
+    httpd_resp_send(req, response.c_str(), HTTPD_RESP_USE_STRLEN);
+  } else {
+    httpd_resp_send(req, "❌ Failed to save photo to SD card!", HTTPD_RESP_USE_STRLEN);
+  }
+  
+  return res;
 }
 
 static esp_err_t stream_handler(httpd_req_t *req) {
@@ -155,10 +279,18 @@ void startCameraServer() {
     .user_ctx = NULL
   };
 
+  httpd_uri_t capture_uri = {
+    .uri = "/capture",
+    .method = HTTP_GET,
+    .handler = capture_handler,
+    .user_ctx = NULL
+  };
+
   httpd_handle_t server = NULL;
   if (httpd_start(&server, &config) == ESP_OK) {
     httpd_register_uri_handler(server, &index_uri);
     httpd_register_uri_handler(server, &stream_uri);
+    httpd_register_uri_handler(server, &capture_uri);
     Serial.println("HTTP server started");
   } else {
     Serial.println("HTTP server failed to start");
@@ -169,6 +301,9 @@ void setup() {
   Serial.begin(115200);
   Serial.println();
   Serial.println("ESP32-CAM Starting...");
+
+  // Initialize SD Card first
+  initSDCard();
 
   // Camera configuration
   camera_config_t config;
@@ -263,6 +398,7 @@ void setup() {
   Serial.println("\n=================================");
   Serial.print("Camera Stream: http://");
   Serial.println(WiFi.localIP());
+  Serial.println("SD Card Status: " + String(sdCardAvailable ? "Available" : "Not Available"));
   Serial.println("=================================");
 }
 
